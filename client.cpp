@@ -93,9 +93,13 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
   }
 
   recv_buffer.insert(recv_buffer.end(), buf->base, buf->base + nread);
-  struct Msg *msg = (struct Msg *)recv_buffer.data();
-  if (recv_buffer.size() >= sizeof(uint32_t) &&
-      msg->length <= recv_buffer.size()) {
+  if (buf->base)
+    free(buf->base);
+
+  struct Msg *msg;
+  while (msg = (struct Msg *)recv_buffer.data(),
+         recv_buffer.size() >= sizeof(uint32_t) &&
+             msg->length <= recv_buffer.size()) {
     if (msg->type == 101) {
       // got ip
       uint8_t *p = msg->data, *begin = msg->data,
@@ -115,11 +119,12 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
       }
       if (count >= 1) {
         printf("Got ip addr %s\n", data[0]);
-        run_cmd("ip a add local %s/32 dev %s", data[0], tun_name);
+        run_cmd("ip -n %s a add local %s/32 dev %s", tun_name, data[0],
+                tun_name);
       }
       if (count >= 2) {
         printf("Got ip route %s\n", data[1]);
-        run_cmd("ip r add %s/0 dev %s", data[1], tun_name);
+        run_cmd("ip -n %s r add %s/0 dev %s", tun_name, data[1], tun_name);
       }
       if (count >= 3) {
         printf("Got dns1 %s\n", data[2]);
@@ -141,8 +146,6 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
 
     recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + msg->length);
   }
-
-  uv_read_start(handle, alloc_cb, on_remote_data);
 }
 
 void on_heartbeat_timer(uv_timer_t *handle) {
@@ -192,7 +195,7 @@ void on_server_connected(uv_connect_t *req, int status) {
   uv_write(&write_req, tcp_stream, &buf, 1, on_write);
 
   uv_timer_init(loop, &timer);
-  uv_timer_start(&timer, on_heartbeat_timer, 0, 20 * 1000);
+  uv_timer_start(&timer, on_heartbeat_timer, 1000, 20 * 1000);
 
   uv_poll_init(loop, &poll, tun_fd);
   uv_poll_start(&poll, UV_READABLE, on_tun_data);
@@ -203,7 +206,8 @@ int main() {
   loop = uv_default_loop();
 
   tun_fd = tun_alloc(tun_name);
-  run_cmd("ip link set dev %s up", tun_name);
+  run_cmd("ip link set dev %s netns %s", tun_name, tun_name);
+  run_cmd("ip -n %s link set dev %s up", tun_name, tun_name);
 
   struct sockaddr_in6 addr;
   uv_ip6_addr(server, 5678, &addr);
