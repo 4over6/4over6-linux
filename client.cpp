@@ -16,6 +16,7 @@
 #include <vector>
 
 const char *server = "2402:f000:1:4417::900";
+char tun_name[IFNAMSIZ] = "4over6";
 uv_loop_t *loop;
 int tun_fd;
 uv_stream_t *tcp_stream;
@@ -31,13 +32,16 @@ struct Msg {
   uint8_t data[4096];
 };
 
+const static int HEADER_LEN = sizeof(uint32_t) + sizeof(uint8_t);
+
+void uv_error(const char *s, int err) { printf("%s: %s", s, uv_strerror(err)); }
+
 int run_cmd(const char *cmd, ...) {
   va_list ap;
   char buf[1024];
   va_start(ap, cmd);
   vsnprintf(buf, sizeof(buf), cmd, ap);
   va_end(ap);
-  printf("$ %s\n", buf);
   return system(buf);
 }
 
@@ -46,7 +50,7 @@ int tun_alloc(char *dev) {
   int fd, err;
 
   if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
-    fprintf(stderr, "Cannot open TUN/TAP dev");
+    perror("Cannot open TUN dev");
     exit(1);
   }
 
@@ -61,7 +65,7 @@ int tun_alloc(char *dev) {
   }
 
   if ((err = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
-    fprintf(stderr, "ERR: Could not ioctl tun: %s\n", strerror(errno));
+    perror("Cannot initialize TUN device");
     close(fd);
     return err;
   }
@@ -72,7 +76,7 @@ int tun_alloc(char *dev) {
 
 void on_write(uv_write_t *req, int status) {
   if (status) {
-    fprintf(stderr, "uv_write error\n");
+    uv_error("Got error upon writing", status);
     return;
   }
 }
@@ -82,20 +86,20 @@ void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
   buf->len = suggested_size;
 }
 
-void on_data_received(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
+void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
   if (nread < 0) {
-    printf("Got error upon reading\n");
+    uv_error("Got error when reading", nread);
     return;
   }
+
   recv_buffer.insert(recv_buffer.end(), buf->base, buf->base + nread);
   struct Msg *msg = (struct Msg *)recv_buffer.data();
-  if (msg->length <= recv_buffer.size()) {
-    printf("Received from server: len %d, type %d\n", msg->length, msg->type);
+  if (recv_buffer.size() >= sizeof(uint32_t) &&
+      msg->length <= recv_buffer.size()) {
     if (msg->type == 101) {
       // got ip
       uint8_t *p = msg->data, *begin = msg->data,
-              *end =
-                  msg->data + msg->length - sizeof(uint32_t) - sizeof(uint8_t);
+              *end = msg->data + msg->length - HEADER_LEN;
       int count = 0;
       char data[5][32];
       while (p <= end) {
@@ -111,11 +115,11 @@ void on_data_received(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
       }
       if (count >= 1) {
         printf("Got ip addr %s\n", data[0]);
-        run_cmd("ip a add local %s/32 dev 4over6", data[0]);
+        run_cmd("ip a add local %s/32 dev %s", data[0], tun_name);
       }
       if (count >= 2) {
         printf("Got ip route %s\n", data[1]);
-        run_cmd("ip r add %s/0 dev 4over6", data[1]);
+        run_cmd("ip r add %s/0 dev %s", data[1], tun_name);
       }
       if (count >= 3) {
         printf("Got dns1 %s\n", data[2]);
@@ -128,21 +132,23 @@ void on_data_received(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
       }
     } else if (msg->type == 103) {
       // got data response
-      size_t length = msg->length - sizeof(uint32_t) - sizeof(uint8_t);
+      size_t length = msg->length - HEADER_LEN;
       printf("Got data response of length %ld\n", length);
       write(tun_fd, msg->data, length);
+    } else if (msg->type == 104) {
+      printf("Got heartbeat from server\n");
     }
 
     recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + msg->length);
   }
 
-  uv_read_start(handle, alloc_cb, on_data_received);
+  uv_read_start(handle, alloc_cb, on_remote_data);
 }
 
-void on_timer(uv_timer_t *handle) {
+void on_heartbeat_timer(uv_timer_t *handle) {
   if (tcp_stream) {
     printf("Sending heartbeat\n");
-    struct Msg heartbeat = {.type = 104, .length = sizeof(int) + sizeof(char)};
+    struct Msg heartbeat = {.type = 104, .length = HEADER_LEN};
     uv_buf_t buf = uv_buf_init((char *)&heartbeat, heartbeat.length);
     uv_write_t write_req;
     uv_write(&write_req, tcp_stream, &buf, 1, on_write);
@@ -157,7 +163,7 @@ void on_tun_data(uv_poll_t *handle, int status, int events) {
     if (tcp_stream) {
       struct Msg data = {.type = 102};
       memcpy(data.data, buf, len);
-      data.length = len + sizeof(uint32_t) + sizeof(uint8_t);
+      data.length = len + HEADER_LEN;
       uv_buf_t buffer = uv_buf_init((char *)&data, data.length);
       uv_write_t write_req;
       uv_write(&write_req, tcp_stream, &buffer, 1, on_write);
@@ -169,44 +175,44 @@ void on_tun_data(uv_poll_t *handle, int status, int events) {
   }
 }
 
-void on_server_connect(uv_connect_t *req, int status) {
-  if (status == -1) {
-    fprintf(stderr, "Error tcp connection");
+void on_server_connected(uv_connect_t *req, int status) {
+  if (status < 0) {
+    uv_error("Failed to initiate tcp connection", status);
     return;
   }
-  uv_stream_t *tcp = req->handle;
-  tcp_stream = tcp;
+  tcp_stream = req->handle;
 
   printf("Connected to server\n");
 
-  uv_read_start(req->handle, alloc_cb, on_data_received);
+  uv_read_start(req->handle, alloc_cb, on_remote_data);
 
-  struct Msg ask_for_addr = {.type = 100, .length = sizeof(int) + sizeof(char)};
+  struct Msg ask_for_addr = {.type = 100, .length = HEADER_LEN};
   uv_buf_t buf = uv_buf_init((char *)&ask_for_addr, ask_for_addr.length);
   uv_write_t write_req;
-  uv_write(&write_req, tcp, &buf, 1, on_write);
+  uv_write(&write_req, tcp_stream, &buf, 1, on_write);
 
   uv_timer_init(loop, &timer);
-  uv_timer_start(&timer, on_timer, 0, 20 * 1000);
+  uv_timer_start(&timer, on_heartbeat_timer, 0, 20 * 1000);
 
   uv_poll_init(loop, &poll, tun_fd);
   uv_poll_start(&poll, UV_READABLE, on_tun_data);
 }
 
 int main() {
+  int err;
   loop = uv_default_loop();
 
-  char tun_name[IFNAMSIZ] = "4over6";
   tun_fd = tun_alloc(tun_name);
   run_cmd("ip link set dev %s up", tun_name);
-  run_cmd("sleep 0.5");
 
   struct sockaddr_in6 addr;
   uv_ip6_addr(server, 5678, &addr);
 
   uv_tcp_init(loop, &tcp);
-  uv_tcp_connect(&tcp_connect, &tcp, (struct sockaddr *)&addr,
-                 on_server_connect);
+  if ((err = uv_tcp_connect(&tcp_connect, &tcp, (struct sockaddr *)&addr,
+                            on_server_connected)) < 0) {
+    uv_error("Failed to initiate connection to server", err);
+  }
 
   return uv_run(loop, UV_RUN_DEFAULT);
 }
