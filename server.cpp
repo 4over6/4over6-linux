@@ -151,7 +151,7 @@ void on_tun_data(uv_poll_t *handle, int status, int events) {
       uv_write_t write_req;
       uv_write(&write_req, (uv_stream_t *)&tcp_client, &buffer, 1, on_write);
       printf("IP len in header: %d\n", (int)ntohs(hdr->tot_len));
-      printf("Got data of size %ld from tun and sent to server\n", len);
+      printf("Got data of size %ld from tun and sent to client\n", len);
     } else if (hdr->version == 6) {
       printf("Ignoring IPv6 packet\n");
     } else {

@@ -16,8 +16,7 @@
 #include <uv.h>
 #include <vector>
 
-//const char *server = "2402:f000:1:4417::900";
-const char *server = "::";
+const char *server = "2402:f000:1:4417::900";
 char tun_name[IFNAMSIZ] = "4over6";
 uv_loop_t *loop;
 int tun_fd;
