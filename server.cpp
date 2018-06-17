@@ -16,16 +16,14 @@
 #include <uv.h>
 #include <vector>
 
-//const char *server = "2402:f000:1:4417::900";
-const char *server = "::";
-char tun_name[IFNAMSIZ] = "4over6";
+char tun_name[IFNAMSIZ] = "4over6server";
 uv_loop_t *loop;
 int tun_fd;
-uv_stream_t *tcp_stream;
 uv_poll_t poll;
 uv_timer_t timer;
 uv_connect_t tcp_connect;
-uv_tcp_t tcp;
+uv_tcp_t tcp_server;
+uv_tcp_t tcp_client;
 std::vector<uint8_t> recv_buffer;
 
 struct Msg {
@@ -102,48 +100,21 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
   while (msg = (struct Msg *)recv_buffer.data(),
          recv_buffer.size() >= sizeof(uint32_t) &&
              msg->length <= recv_buffer.size()) {
-    if (msg->type == 101) {
-      // got ip
-      uint8_t *p = msg->data, *begin = msg->data,
-              *end = msg->data + msg->length - HEADER_LEN;
-      int count = 0;
-      char data[5][32];
-      while (p <= end) {
-        if (p == end || *p == ' ') {
-          if (count < 5) {
-            memcpy(data[count], begin, p - begin);
-            data[count][p - begin] = '\0';
-            count++;
-          }
-          begin = p + 1;
-        }
-        p++;
-      }
-      if (count >= 1) {
-        printf("Got ip addr %s\n", data[0]);
-        run_cmd("ip -n %s a add local %s/32 dev %s", tun_name, data[0],
-                tun_name);
-      }
-      if (count >= 2) {
-        printf("Got ip route %s\n", data[1]);
-        run_cmd("ip -n %s r add %s/0 dev %s", tun_name, data[1], tun_name);
-      }
-      if (count >= 3) {
-        printf("Got dns1 %s\n", data[2]);
-      }
-      if (count >= 4) {
-        printf("Got dns2 %s\n", data[3]);
-      }
-      if (count >= 5) {
-        printf("Got dns3 %s\n", data[4]);
-      }
-    } else if (msg->type == 103) {
-      // got data response
+    if (msg->type == 100) {
+      char result[] = "13.8.0.2 0.0.0.0 101.6.6.6 166.111.8.28 166.111.8.29";
+      struct Msg msg = {.type = 101};
+      msg.length = strlen(result) + HEADER_LEN;
+      memcpy(msg.data, result, strlen(result));
+      uv_buf_t buf = uv_buf_init((char *)&msg, msg.length);
+      uv_write_t write_req;
+      uv_write(&write_req, (uv_stream_t *)&tcp_client, &buf, 1, on_write);
+    } else if (msg->type == 102) {
+      // got data request
       size_t length = msg->length - HEADER_LEN;
       printf("Got data response of length %ld\n", length);
       write(tun_fd, msg->data, length);
     } else if (msg->type == 104) {
-      printf("Got heartbeat from server\n");
+      printf("Got heartbeat from client\n");
     } else {
       printf("Unrecognized type: %d\n", msg->type);
     }
@@ -155,6 +126,7 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
 }
 
 void on_heartbeat_timer(uv_timer_t *handle) {
+    /*
   if (tcp_stream) {
     printf("Sending heartbeat\n");
     struct Msg heartbeat = {.type = 104, .length = HEADER_LEN};
@@ -162,56 +134,44 @@ void on_heartbeat_timer(uv_timer_t *handle) {
     uv_write_t write_req;
     uv_write(&write_req, tcp_stream, &buf, 1, on_write);
   }
+  */
 }
 
 void on_tun_data(uv_poll_t *handle, int status, int events) {
   uint8_t buf[4096];
   size_t max_len = sizeof(buf);
   ssize_t len = read(tun_fd, buf, max_len);
-  if (tcp_stream) {
-    if (len >= sizeof(struct iphdr)) {
-      struct iphdr *hdr = (struct iphdr *)buf;
-      if (hdr->version == 4) {
-        struct Msg data = {.type = 102};
-        memcpy(data.data, buf, len);
-        data.length = len + HEADER_LEN;
-        uv_buf_t buffer = uv_buf_init((char *)&data, len + HEADER_LEN);
-        uv_write_t write_req;
-        uv_write(&write_req, tcp_stream, &buffer, 1, on_write);
-        printf("IP len in header: %d\n", (int)ntohs(hdr->tot_len));
-        printf("Got data of size %ld from tun and sent to server\n", len);
-      } else if (hdr->version == 6) {
-        printf("Ignoring IPv6 packet\n");
-      } else {
-        printf("Unrecognized IP packet with version %x\n", hdr->version);
-      }
+  if (len >= sizeof(struct iphdr)) {
+    struct iphdr *hdr = (struct iphdr *)buf;
+    if (hdr->version == 4) {
+      struct Msg data = {.type = 103};
+      memcpy(data.data, buf, len);
+      data.length = len + HEADER_LEN;
+      uv_buf_t buffer = uv_buf_init((char *)&data, len + HEADER_LEN);
+      uv_write_t write_req;
+      uv_write(&write_req, (uv_stream_t *)&tcp_client, &buffer, 1, on_write);
+      printf("IP len in header: %d\n", (int)ntohs(hdr->tot_len));
+      printf("Got data of size %ld from tun and sent to server\n", len);
+    } else if (hdr->version == 6) {
+      printf("Ignoring IPv6 packet\n");
+    } else {
+      printf("Unrecognized IP packet with version %x\n", hdr->version);
     }
-  } else {
-    printf("Got data of size %ld from tun and but server not connected\n", len);
   }
 }
 
-void on_server_connected(uv_connect_t *req, int status) {
+void on_client_connected(uv_stream_t *req, int status) {
   if (status < 0) {
     uv_error("Failed to initiate tcp connection", status);
     return;
   }
-  tcp_stream = req->handle;
-
-  printf("Connected to server\n");
-
-  uv_read_start(req->handle, alloc_cb, on_remote_data);
-
-  struct Msg ask_for_addr = {.type = 100, .length = HEADER_LEN};
-  uv_buf_t buf = uv_buf_init((char *)&ask_for_addr, ask_for_addr.length);
-  uv_write_t write_req;
-  uv_write(&write_req, tcp_stream, &buf, 1, on_write);
-
-  uv_timer_init(loop, &timer);
-  uv_timer_start(&timer, on_heartbeat_timer, 1000, 20 * 1000);
+  uv_tcp_init(loop, &tcp_client);
+  uv_accept(req, (uv_stream_t *)&tcp_client);
 
   uv_poll_init(loop, &poll, tun_fd);
   uv_poll_start(&poll, UV_READABLE, on_tun_data);
+
+  uv_read_start((uv_stream_t *)&tcp_client, alloc_cb, on_remote_data);
 }
 
 int main() {
@@ -219,17 +179,18 @@ int main() {
   loop = uv_default_loop();
 
   tun_fd = tun_alloc(tun_name);
-  run_cmd("ip netns add %s", tun_name);
-  run_cmd("ip link set dev %s netns %s", tun_name, tun_name);
-  run_cmd("ip -n %s link set dev %s mtu %d", tun_name, tun_name, 1500 - HEADER_LEN);
-  run_cmd("ip -n %s link set dev %s up", tun_name, tun_name);
+  run_cmd("ip link set dev %s up", tun_name);
+  run_cmd("ip link set dev %s mtu %d", tun_name, 1500 - HEADER_LEN);
+  run_cmd("sleep 0.5");
+  run_cmd("ip a add 13.8.0.1/24 dev %s", tun_name);
 
   struct sockaddr_in6 addr;
-  uv_ip6_addr(server, 5678, &addr);
+  uv_ip6_addr("::", 5678, &addr);
 
-  uv_tcp_init(loop, &tcp);
-  if ((err = uv_tcp_connect(&tcp_connect, &tcp, (struct sockaddr *)&addr,
-                            on_server_connected)) < 0) {
+  uv_tcp_init(loop, &tcp_server);
+  uv_tcp_bind(&tcp_server, (struct sockaddr *)&addr, 0);
+  if ((err = uv_listen((uv_stream_t *)&tcp_server, 10, on_client_connected)) <
+      0) {
     uv_error("Failed to initiate connection to server", err);
   }
 
