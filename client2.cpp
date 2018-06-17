@@ -88,7 +88,15 @@ uint8_t *read_exact(int fd, size_t len) {
   while (read_length < len) {
     ssize_t read_bytes = pth_read(fd, ptr, len - read_length);
     if (read_bytes < 0) {
-      print("read got error %d\n", read_bytes);
+      if (read_bytes == EAGAIN || read_bytes == EWOULDBLOCK) {
+        continue;
+      } else if (read_bytes == -1) {
+        if (errno == EAGAIN) {
+          continue;
+        }
+        perror("read");
+        assert(false);
+      }
     } else {
       read_length += read_bytes;
       ptr += read_bytes;
@@ -106,14 +114,31 @@ void *server_read(void *arg) {
   pi->proto = htons(ETH_P_IP);
   while (1) {
     struct Msg *msg = (struct Msg *)read_exact(socket_fd, HEADER_LEN);
-    if (msg->type == 103) {
-      size_t len = msg->length - HEADER_LEN;
-      uint8_t *ip = read_exact(socket_fd, len);
-      memcpy(buffer + sizeof(struct tun_pi), ip, len);
-      pth_write(tun_fd, buffer, len + sizeof(struct tun_pi));
-      free(ip);
-    } else {
-      print("Unrecognised msg type: %d\n", msg->type);
+    size_t len = msg->length - HEADER_LEN;
+    if (len > 0) {
+      uint8_t *body = read_exact(socket_fd, len);
+      if (msg->type == 103) {
+        memcpy(buffer + sizeof(struct tun_pi), body, len);
+        pth_write(tun_fd, buffer, len + sizeof(struct tun_pi));
+      } else if (msg->type == 101) {
+        char ip[32], route[32], dns1[32], dns2[32], dns3[32];
+
+        char buffer[1024];
+        memcpy(buffer, body, len);
+        buffer[len] = '\0';
+
+        sscanf(buffer, "%s %s %s %s %s", ip, route, dns1, dns2, dns3);
+
+        printf("Got ip addr %s\n", ip);
+        run_cmd("ip -n %s a add local %s/32 dev %s", tun_name, ip,
+                tun_name);
+        printf("Got ip route %s\n", route);
+        run_cmd("ip -n %s r add %s/0 dev %s", tun_name, route, tun_name);
+
+      } else {
+        print("Unrecognised msg type: %d\n", msg->type);
+      }
+      free(body);
     }
     free(msg);
   }
@@ -139,19 +164,17 @@ void *tun_read(void *arg) {
     uint16_t proto = ntohs(pi->proto);
     if (proto == ETH_P_IP) {
       struct iphdr *hdr = (struct iphdr *)current;
-      uint8_t *ip = current;
-      uint16_t len = ntohs(hdr->tot_len);
-      uint8_t header_len = hdr->ihl * 4;
-      current += header_len;
-      assert(current <= end);
-
-      uint8_t *body = current;
-      uint16_t body_len = len - header_len;
-      current += body_len;
-      assert(current == end);
-
       if (hdr->version == 4) {
-        print("Got IPv4 packet of length %d\n", len);
+        uint8_t *ip = current;
+        uint16_t len = ntohs(hdr->tot_len);
+        uint8_t header_len = hdr->ihl * 4;
+        current += header_len;
+        assert(current <= end);
+
+        uint8_t *body = current;
+        uint16_t body_len = len - header_len;
+        current += body_len;
+        assert(current == end);
 
         struct Msg data = {.type = 102};
         memcpy(data.data, ip, len);
@@ -159,15 +182,13 @@ void *tun_read(void *arg) {
         if (pth_write(socket_fd, &data, data.length) < 0) {
           perror("pth_write");
         }
-      } else if (hdr->version == 6) {
-        print("Got IPv6 packet of length %d\n", len);
       } else {
-        printf("Unrecognised IP packet\n");
+        print("Unrecognised IP packet\n");
       }
     } else if (proto == ETH_P_IPV6) {
-      printf("IPv6 packet ignored\n");
+      print("IPv6 packet ignored\n");
     } else {
-      printf("Unrecognised proto type 0x%04X\n", proto);
+      print("Unrecognised proto type 0x%04X\n", proto);
     }
   }
   return NULL;
@@ -175,7 +196,15 @@ void *tun_read(void *arg) {
 
 void *send_heartbeat(void *arg) {
   int socket_fd = (int)(size_t)arg;
-  print("Got %d\n", socket_fd);
+  while (1) {
+    print("Sending heartbeat\n");
+    struct Msg heartbeat = {.type = 104, .length = HEADER_LEN};
+    if (pth_write(socket_fd, &heartbeat, heartbeat.length) < 0) {
+      perror("pth_write");
+      break;
+    }
+    pth_nap(pth_time(20, 0));
+  }
   return NULL;
 }
 
@@ -194,6 +223,12 @@ void *connect_server(void *arg) {
   if (pth_connect(socket_fd, (struct sockaddr *)&addr, sizeof(sockaddr_in6)) <
       0) {
     perror("failed to connect to server");
+    return NULL;
+  }
+
+  struct Msg handshake = {.type = 100, .length = HEADER_LEN};
+  if (pth_write(socket_fd, &handshake, handshake.length) < 0) {
+    perror("pth_write");
     return NULL;
   }
 
@@ -231,8 +266,6 @@ int main(int argc, char **argv) {
   run_cmd("ip -n %s link set dev %s mtu %d", tun_name, tun_name,
           1500 - HEADER_LEN);
   run_cmd("ip -n %s link set dev %s up", tun_name, tun_name);
-  run_cmd("ip -n %s r add default dev %s", tun_name, tun_name);
-  run_cmd("ip -n %s a add 13.8.0.2 dev %s", tun_name, tun_name);
 
   pth_attr_t attr;
   attr = pth_attr_new();
