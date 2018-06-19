@@ -7,6 +7,7 @@
 #include <linux/ip.h>
 #include <netinet/in.h>
 #include <pth.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +28,7 @@ struct Msg {
   uint8_t data[4096];
 };
 
-const static int HEADER_LEN = sizeof(uint32_t) + sizeof(uint8_t);
+const static uint32_t HEADER_LEN = sizeof(uint32_t) + sizeof(uint8_t);
 
 int run_cmd(const char *cmd, ...) {
   va_list ap;
@@ -81,29 +82,39 @@ int tun_alloc(char *dev) {
   return fd;
 }
 
+// len should be less than buffer_size
+// The returned pointer should be used at once
+// May not be valid after next call
 uint8_t *read_exact(int fd, size_t len) {
-  size_t read_length = 0;
-  uint8_t *buffer = (uint8_t *)malloc(len);
-  uint8_t *ptr = buffer;
-  while (read_length < len) {
-    ssize_t read_bytes = pth_read(fd, ptr, len - read_length);
+  static size_t pos = 0;
+  static size_t end = 0;
+  const static size_t buffer_size = 40960;
+  static uint8_t buffer[buffer_size];
+  if (pos + len >= buffer_size) {
+    // not enough size, put back to beginning
+    memmove(buffer, buffer + pos, end - pos);
+    end = end - pos;
+    pos = 0;
+  }
+
+  uint8_t *result = buffer + pos;
+  uint8_t *ptr = buffer + end;
+  while (ptr < buffer + pos + len) {
+    ssize_t read_bytes = pth_read(fd, ptr, buffer_size - end);
     if (read_bytes < 0) {
-      if (read_bytes == EAGAIN || read_bytes == EWOULDBLOCK) {
+      if (read_bytes == -1 && errno == EAGAIN) {
         continue;
-      } else if (read_bytes == -1) {
-        if (errno == EAGAIN) {
-          continue;
-        }
-        perror("read");
-        assert(false);
       }
+      perror("read");
+      assert(false);
     } else {
-      read_length += read_bytes;
       ptr += read_bytes;
+      end += read_bytes;
     }
   }
 
-  return buffer;
+  pos += len;
+  return result;
 }
 
 void *server_read(void *arg) {
@@ -114,13 +125,17 @@ void *server_read(void *arg) {
   pi->proto = htons(ETH_P_IP);
   while (1) {
     struct Msg *msg = (struct Msg *)read_exact(socket_fd, HEADER_LEN);
-    size_t len = msg->length - HEADER_LEN;
+    uint32_t msg_length = msg->length;
+    uint8_t msg_type = msg->type;
+    // don't use msg any more
+
+    size_t len = msg_length - HEADER_LEN;
     if (len > 0) {
       uint8_t *body = read_exact(socket_fd, len);
-      if (msg->type == 103) {
+      if (msg_type == 103) {
         memcpy(buffer + sizeof(struct tun_pi), body, len);
         pth_write(tun_fd, buffer, len + sizeof(struct tun_pi));
-      } else if (msg->type == 101) {
+      } else if (msg_type == 101) {
         char ip[32], route[32], dns1[32], dns2[32], dns3[32];
 
         char buffer[1024];
@@ -130,17 +145,13 @@ void *server_read(void *arg) {
         sscanf(buffer, "%s %s %s %s %s", ip, route, dns1, dns2, dns3);
 
         printf("Got ip addr %s\n", ip);
-        run_cmd("ip -n %s a add local %s/32 dev %s", tun_name, ip,
-                tun_name);
+        run_cmd("ip -n %s a add local %s/32 dev %s", tun_name, ip, tun_name);
         printf("Got ip route %s\n", route);
         run_cmd("ip -n %s r add %s/0 dev %s", tun_name, route, tun_name);
-
       } else {
-        print("Unrecognised msg type: %d\n", msg->type);
+        print("Unrecognised msg type: %d\n", msg_type);
       }
-      free(body);
     }
-    free(msg);
   }
   return NULL;
 }
@@ -198,7 +209,7 @@ void *send_heartbeat(void *arg) {
   int socket_fd = (int)(size_t)arg;
   while (1) {
     print("Sending heartbeat\n");
-    struct Msg heartbeat = {.type = 104, .length = HEADER_LEN};
+    struct Msg heartbeat = {.length = HEADER_LEN, .type = 104};
     if (pth_write(socket_fd, &heartbeat, heartbeat.length) < 0) {
       perror("pth_write");
       break;
@@ -226,7 +237,7 @@ void *connect_server(void *arg) {
     return NULL;
   }
 
-  struct Msg handshake = {.type = 100, .length = HEADER_LEN};
+  struct Msg handshake = { .length = HEADER_LEN, .type = 100};
   if (pth_write(socket_fd, &handshake, handshake.length) < 0) {
     perror("pth_write");
     return NULL;
