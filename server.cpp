@@ -18,15 +18,22 @@
 
 char tun_name[IFNAMSIZ] = "4over6server";
 uv_loop_t *loop;
-int tun_fd;
-uv_poll_t poll;
+const static int TUN_FDS = 10;
+int tun_fds[TUN_FDS];
+uv_poll_t polls[TUN_FDS];
 uv_timer_t timer;
 uv_connect_t tcp_connect;
 uv_tcp_t tcp_server;
 uv_tcp_t tcp_client;
 std::vector<uint8_t> recv_buffer;
 
-struct Msg {
+typedef struct write_req_t {
+  uv_write_t req;
+  uv_buf_t buf;
+} write_req_t;
+
+struct Msg
+{
   uint32_t length;
   uint8_t type;
   uint8_t data[4096];
@@ -45,33 +52,32 @@ int run_cmd(const char *cmd, ...) {
   return system(buf);
 }
 
-int tun_alloc(char *dev) {
+void tun_alloc(char *dev) {
   struct ifreq ifr = {0};
-  int fd, err;
-
-  if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
-    perror("Cannot open TUN dev");
-    exit(1);
-  }
 
   /* Flags: IFF_TUN   - TUN device (no Ethernet headers)
    *        IFF_TAP   - TAP device
    *
    *        IFF_NO_PI - Do not provide packet information
    */
-  ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+  ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
   if (*dev) {
     strncpy(ifr.ifr_name, dev, IFNAMSIZ);
   }
 
-  if ((err = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
-    perror("Cannot initialize TUN device");
-    close(fd);
-    return err;
+  for (int i = 0; i < TUN_FDS; i++) {
+    if ((tun_fds[i] = open("/dev/net/tun", O_RDWR)) < 0) {
+      perror("Cannot open TUN dev");
+      exit(1);
+    }
+    if (ioctl(tun_fds[i], TUNSETIFF, (void *)&ifr) < 0) {
+      perror("Cannot initialize TUN device");
+      exit(1);
+    }
   }
 
   strcpy(dev, ifr.ifr_name);
-  return fd;
+  return;
 }
 
 void on_write(uv_write_t *req, int status) {
@@ -79,6 +85,9 @@ void on_write(uv_write_t *req, int status) {
     uv_error("Got error upon writing", status);
     return;
   }
+  write_req_t *wr = (write_req_t *)req;
+  free(wr->buf.base);
+  free(wr);
 }
 
 void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
@@ -102,17 +111,22 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
              msg->length <= recv_buffer.size()) {
     if (msg->type == 100) {
       char result[] = "13.8.0.2 0.0.0.0 101.6.6.6 166.111.8.28 166.111.8.29";
-      struct Msg msg = {.type = 101};
-      msg.length = strlen(result) + HEADER_LEN;
-      memcpy(msg.data, result, strlen(result));
-      uv_buf_t buf = uv_buf_init((char *)&msg, msg.length);
-      uv_write_t write_req;
-      uv_write(&write_req, (uv_stream_t *)&tcp_client, &buf, 1, on_write);
+
+      write_req_t *wr = (write_req_t *)malloc(sizeof(write_req_t));
+      size_t msg_length = strlen(result) + HEADER_LEN;
+      wr->buf = uv_buf_init((char *)malloc(msg_length), msg_length);
+
+      struct Msg *new_msg = (struct Msg *)wr->buf.base;
+      new_msg->type = 101;
+      new_msg->length = msg_length;
+      memcpy(new_msg->data, result, strlen(result));
+      uv_write((uv_write_t *)wr, (uv_stream_t *)&tcp_client, &wr->buf, 1, on_write);
     } else if (msg->type == 102) {
       // got data request
       size_t length = msg->length - HEADER_LEN;
       printf("Got data response of length %ld\n", length);
-      write(tun_fd, msg->data, length);
+      static int index = 0;
+      write(tun_fds[(index++) % TUN_FDS], msg->data, length);
     } else if (msg->type == 104) {
       printf("Got heartbeat from client\n");
     } else {
@@ -126,30 +140,35 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
 }
 
 void on_heartbeat_timer(uv_timer_t *handle) {
-    /*
-  if (tcp_stream) {
-    printf("Sending heartbeat\n");
-    struct Msg heartbeat = {.type = 104, .length = HEADER_LEN};
-    uv_buf_t buf = uv_buf_init((char *)&heartbeat, heartbeat.length);
-    uv_write_t write_req;
-    uv_write(&write_req, tcp_stream, &buf, 1, on_write);
-  }
-  */
+  /*
+if (tcp_stream) {
+  printf("Sending heartbeat\n");
+  struct Msg heartbeat = {.type = 104, .length = HEADER_LEN};
+  uv_buf_t buf = uv_buf_init((char *)&heartbeat, heartbeat.length);
+  uv_write_t write_req;
+  uv_write(&write_req, tcp_stream, &buf, 1, on_write);
+}
+*/
 }
 
 void on_tun_data(uv_poll_t *handle, int status, int events) {
   uint8_t buf[4096];
   size_t max_len = sizeof(buf);
+  int tun_fd = (int)(size_t)handle->data;
   ssize_t len = read(tun_fd, buf, max_len);
   if (len >= sizeof(struct iphdr)) {
     struct iphdr *hdr = (struct iphdr *)buf;
     if (hdr->version == 4) {
-      struct Msg data = {.type = 103};
-      memcpy(data.data, buf, len);
-      data.length = len + HEADER_LEN;
-      uv_buf_t buffer = uv_buf_init((char *)&data, len + HEADER_LEN);
-      uv_write_t write_req;
-      uv_write(&write_req, (uv_stream_t *)&tcp_client, &buffer, 1, on_write);
+      write_req_t *wr = (write_req_t *)malloc(sizeof(write_req_t));
+      size_t msg_length = len + HEADER_LEN;
+      wr->buf = uv_buf_init((char *)malloc(msg_length), msg_length);
+
+      struct Msg *new_msg = (struct Msg *)wr->buf.base;
+      new_msg->type = 103;
+      new_msg->length = msg_length;
+      memcpy(new_msg->data, buf, len);
+      uv_write((uv_write_t *)wr, (uv_stream_t *)&tcp_client, &wr->buf, 1, on_write);
+
       printf("IP len in header: %d\n", (int)ntohs(hdr->tot_len));
       printf("Got data of size %ld from tun and sent to client\n", len);
     } else if (hdr->version == 6) {
@@ -168,8 +187,11 @@ void on_client_connected(uv_stream_t *req, int status) {
   uv_tcp_init(loop, &tcp_client);
   uv_accept(req, (uv_stream_t *)&tcp_client);
 
-  uv_poll_init(loop, &poll, tun_fd);
-  uv_poll_start(&poll, UV_READABLE, on_tun_data);
+  for (int i = 0; i < TUN_FDS; i++) {
+    uv_poll_init(loop, &polls[i], tun_fds[i]);
+    polls[i].data = (void *)(size_t)tun_fds[i];
+    uv_poll_start(&polls[i], UV_READABLE, on_tun_data);
+  }
 
   uv_read_start((uv_stream_t *)&tcp_client, alloc_cb, on_remote_data);
 }
@@ -178,7 +200,7 @@ int main() {
   int err;
   loop = uv_default_loop();
 
-  tun_fd = tun_alloc(tun_name);
+  tun_alloc(tun_name);
   run_cmd("ip link set dev %s up", tun_name);
   run_cmd("ip link set dev %s mtu %d", tun_name, 1500 - HEADER_LEN);
   run_cmd("sleep 0.5");

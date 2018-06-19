@@ -18,9 +18,10 @@
 #include <unistd.h>
 #include <vector>
 
-char server_addr[32] = "2402:f000:1:1141::410";
+char server_addr[32] = "2402:f000:1:1121::410";
 char tun_name[IFNAMSIZ] = "4over6";
-int tun_fd;
+const static int TUN_FDS = 20;
+int tun_fds[TUN_FDS];
 
 struct Msg {
   uint32_t length;
@@ -53,33 +54,32 @@ int print(const char *fmt, ...) {
   return fputs(print_buf, stdout);
 }
 
-int tun_alloc(char *dev) {
+void tun_alloc(char *dev) {
   struct ifreq ifr = {0};
-  int fd, err;
-
-  if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
-    perror("Cannot open TUN dev");
-    exit(1);
-  }
 
   /* Flags: IFF_TUN   - TUN device (no Ethernet headers)
    *        IFF_TAP   - TAP device
    *
    *        IFF_NO_PI - Do not provide packet information
    */
-  ifr.ifr_flags = IFF_TUN;
-  if (*dev) {
+  ifr.ifr_flags = IFF_TUN | IFF_MULTI_QUEUE;
+  if (dev) {
     strncpy(ifr.ifr_name, dev, IFNAMSIZ);
   }
 
-  if ((err = ioctl(fd, TUNSETIFF, (void *)&ifr)) < 0) {
-    perror("Cannot initialize TUN device");
-    close(fd);
-    return err;
+  for (int i = 0; i < TUN_FDS; i++) {
+    if ((tun_fds[i] = open("/dev/net/tun", O_RDWR)) < 0) {
+      perror("Cannot open TUN dev");
+      exit(1);
+    }
+    if (ioctl(tun_fds[i], TUNSETIFF, (void *)&ifr) < 0) {
+      perror("Cannot initialize TUN device");
+      exit(1);
+    }
   }
 
   strcpy(dev, ifr.ifr_name);
-  return fd;
+  return;
 }
 
 // len should be less than buffer_size
@@ -134,7 +134,8 @@ void *server_read(void *arg) {
       uint8_t *body = read_exact(socket_fd, len);
       if (msg_type == 103) {
         memcpy(buffer + sizeof(struct tun_pi), body, len);
-        pth_write(tun_fd, buffer, len + sizeof(struct tun_pi));
+        static int index = 0;
+        pth_write(tun_fds[(index++) % TUN_FDS], buffer, len + sizeof(struct tun_pi));
       } else if (msg_type == 101) {
         char ip[32], route[32], dns1[32], dns2[32], dns3[32];
 
@@ -157,7 +158,9 @@ void *server_read(void *arg) {
 }
 
 void *tun_read(void *arg) {
-  int socket_fd = (int)(size_t)arg;
+  int *fds = (int *)arg;
+  int socket_fd = fds[0];
+  int tun_fd = fds[1];
   uint8_t buffer[4096];
   while (1) {
     uint8_t *current = buffer;
@@ -187,7 +190,8 @@ void *tun_read(void *arg) {
         current += body_len;
         assert(current == end);
 
-        struct Msg data = {.type = 102};
+        struct Msg data;
+        data.type = 102;
         memcpy(data.data, ip, len);
         data.length = len + HEADER_LEN;
         if (pth_write(socket_fd, &data, data.length) < 0) {
@@ -202,6 +206,7 @@ void *tun_read(void *arg) {
       print("Unrecognised proto type 0x%04X\n", proto);
     }
   }
+  free(fds);
   return NULL;
 }
 
@@ -237,7 +242,7 @@ void *connect_server(void *arg) {
     return NULL;
   }
 
-  struct Msg handshake = { .length = HEADER_LEN, .type = 100};
+  struct Msg handshake = {.length = HEADER_LEN, .type = 100};
   if (pth_write(socket_fd, &handshake, handshake.length) < 0) {
     perror("pth_write");
     return NULL;
@@ -247,7 +252,11 @@ void *connect_server(void *arg) {
   attr = pth_attr_new();
 
   pth_attr_set(attr, PTH_ATTR_NAME, "tun_read");
-  pth_t tun = pth_spawn(attr, tun_read, (void *)(size_t)socket_fd);
+  for (int i = 0; i < TUN_FDS;i++) {
+    int *fds = (int *)malloc(2 * sizeof(int));
+    fds[0] = socket_fd, fds[1] = tun_fds[i];
+    pth_t tun = pth_spawn(attr, tun_read, (void *)fds);
+  }
 
   pth_attr_set(attr, PTH_ATTR_NAME, "server_read");
   pth_t server = pth_spawn(attr, server_read, (void *)(size_t)socket_fd);
@@ -257,7 +266,6 @@ void *connect_server(void *arg) {
 
   pth_attr_destroy(attr);
 
-  pth_join(tun, NULL);
   pth_join(server, NULL);
   pth_join(send, NULL);
 
@@ -271,7 +279,7 @@ int main(int argc, char **argv) {
   }
   pth_init();
 
-  tun_fd = tun_alloc(tun_name);
+  tun_alloc(tun_name);
   run_cmd("ip netns add %s", tun_name);
   run_cmd("ip link set dev %s netns %s", tun_name, tun_name);
   run_cmd("ip -n %s link set dev %s mtu %d", tun_name, tun_name,

@@ -16,7 +16,7 @@
 #include <uv.h>
 #include <vector>
 
-const char *server = "2402:f000:1:4417::900";
+char server[1024] = "2402:f000:1:4417::900";
 char tun_name[IFNAMSIZ] = "4over6";
 uv_loop_t *loop;
 int tun_fd;
@@ -213,8 +213,12 @@ void on_server_connected(uv_connect_t *req, int status) {
   uv_poll_start(&poll, UV_READABLE, on_tun_data);
 }
 
-int main() {
+int main(int argc, char **argv) {
   int err;
+  if (argc > 1) {
+    // unsafe
+    strcpy(server, argv[1]);
+  }
   loop = uv_default_loop();
 
   tun_fd = tun_alloc(tun_name);
