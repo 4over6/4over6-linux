@@ -16,6 +16,9 @@
 #include <uv.h>
 #include <vector>
 
+#define print(fmt, args...)                                                    \
+  printf("DEBUG: %s:%d:%s(): " fmt, __FILE__, __LINE__, __func__, ##args)
+
 char server[1024] = "2402:f000:1:4417::900";
 char tun_name[IFNAMSIZ] = "4over6";
 uv_loop_t *loop;
@@ -35,7 +38,9 @@ struct Msg {
 
 const static int HEADER_LEN = sizeof(uint32_t) + sizeof(uint8_t);
 
-void uv_error(const char *s, int err) { printf("%s: %s", s, uv_strerror(err)); }
+void uv_error(const char *s, int err) {
+  print("%s: %s\n", s, uv_strerror(err));
+}
 
 int run_cmd(const char *cmd, ...) {
   va_list ap;
@@ -89,7 +94,12 @@ void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
 
 void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
   if (nread < 0) {
-    uv_error("Got error when reading", nread);
+    if (nread == UV_EOF) {
+      print("Server closed the connection, exiting.");
+      exit(0);
+    } else {
+      uv_error("Got error when reading", nread);
+    }
     return;
   }
 
@@ -119,32 +129,32 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
         p++;
       }
       if (count >= 1) {
-        printf("Got ip addr %s\n", data[0]);
+        print("Got ip addr %s\n", data[0]);
         run_cmd("ip -n %s a add local %s/32 dev %s", tun_name, data[0],
                 tun_name);
       }
       if (count >= 2) {
-        printf("Got ip route %s\n", data[1]);
+        print("Got ip route %s\n", data[1]);
         run_cmd("ip -n %s r add %s/0 dev %s", tun_name, data[1], tun_name);
       }
       if (count >= 3) {
-        printf("Got dns1 %s\n", data[2]);
+        print("Got dns1 %s\n", data[2]);
       }
       if (count >= 4) {
-        printf("Got dns2 %s\n", data[3]);
+        print("Got dns2 %s\n", data[3]);
       }
       if (count >= 5) {
-        printf("Got dns3 %s\n", data[4]);
+        print("Got dns3 %s\n", data[4]);
       }
     } else if (msg->type == 103) {
       // got data response
       size_t length = msg->length - HEADER_LEN;
-      printf("Got data response of length %ld\n", length);
+      print("Got data response of length %ld\n", length);
       write(tun_fd, msg->data, length);
     } else if (msg->type == 104) {
-      printf("Got heartbeat from server\n");
+      print("Got heartbeat from server\n");
     } else {
-      printf("Unrecognized type: %d\n", msg->type);
+      print("Unrecognized type: %d\n", msg->type);
     }
 
     recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + msg->length);
@@ -155,7 +165,7 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
 
 void on_heartbeat_timer(uv_timer_t *handle) {
   if (tcp_stream) {
-    printf("Sending heartbeat\n");
+    print("Sending heartbeat\n");
     struct Msg heartbeat = {.type = 104, .length = HEADER_LEN};
     uv_buf_t buf = uv_buf_init((char *)&heartbeat, heartbeat.length);
     uv_write_t write_req;
@@ -177,16 +187,16 @@ void on_tun_data(uv_poll_t *handle, int status, int events) {
         uv_buf_t buffer = uv_buf_init((char *)&data, len + HEADER_LEN);
         uv_write_t write_req;
         uv_write(&write_req, tcp_stream, &buffer, 1, on_write);
-        printf("IP len in header: %d\n", (int)ntohs(hdr->tot_len));
-        printf("Got data of size %ld from tun and sent to server\n", len);
+        print("IP len in header: %d\n", (int)ntohs(hdr->tot_len));
+        print("Got data of size %ld from tun and sent to server\n", len);
       } else if (hdr->version == 6) {
-        printf("Ignoring IPv6 packet\n");
+        print("Ignoring IPv6 packet\n");
       } else {
-        printf("Unrecognized IP packet with version %x\n", hdr->version);
+        print("Unrecognized IP packet with version %x\n", hdr->version);
       }
     }
   } else {
-    printf("Got data of size %ld from tun and but server not connected\n", len);
+    print("Got data of size %ld from tun and but server not connected\n", len);
   }
 }
 
@@ -197,7 +207,7 @@ void on_server_connected(uv_connect_t *req, int status) {
   }
   tcp_stream = req->handle;
 
-  printf("Connected to server\n");
+  print("Connected to server\n");
 
   uv_read_start(req->handle, alloc_cb, on_remote_data);
 

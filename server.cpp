@@ -12,9 +12,13 @@
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <uv.h>
 #include <vector>
+
+#define print(fmt, args...)                                                    \
+  printf("DEBUG: %s:%d:%s(): " fmt, __FILE__, __LINE__, __func__, ##args)
 
 char tun_name[IFNAMSIZ] = "4over6server";
 uv_loop_t *loop;
@@ -53,7 +57,9 @@ struct Ip_Addr {
 
 const static int HEADER_LEN = sizeof(uint32_t) + sizeof(uint8_t);
 
-void uv_error(const char *s, int err) { printf("%s: %s", s, uv_strerror(err)); }
+void uv_error(const char *s, int err) {
+  print("%s: %s\n", s, uv_strerror(err));
+}
 
 int run_cmd(const char *cmd, ...) {
   va_list ap;
@@ -109,11 +115,35 @@ void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
 
 void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
   if (nread < 0) {
-    uv_error("Got error when reading", nread);
-    uv_read_stop(handle);
+    if (nread == UV_EOF) {
+      // connection closed
+
+      struct User_Info_Table *prev = nullptr;
+      struct User_Info_Table *p = users;
+      while (p != nullptr) {
+        if ((uv_stream_t *)&p->tcp_client == handle) {
+          char ipv4_addr[32];
+          uv_ip4_name(&p->v4addr, ipv4_addr, 32);
+          print("Client %s disconnected\n", ipv4_addr);
+          // found it
+          if (prev) {
+            prev->pNext = p->pNext;
+          } else {
+            users = p->pNext;
+          }
+          delete p;
+          break;
+        }
+        prev = p;
+        p = p->pNext;
+      }
+      uv_read_stop(handle);
+    } else {
+      uv_error("Got error when reading", nread);
+      uv_read_stop(handle);
+    }
     return;
   }
-  printf("Read len %d\n", nread);
 
   struct User_Info_Table *p = users;
   while (p != nullptr) {
@@ -126,8 +156,11 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
              p->recv_buffer.size() >= sizeof(uint32_t) &&
                  msg->length <= p->recv_buffer.size()) {
         if (msg->type == 100) {
-          char result[] =
-              "13.8.0.2 0.0.0.0 101.6.6.6 166.111.8.28 166.111.8.29";
+          char ipv4_addr[32];
+          uv_ip4_name(&p->v4addr, ipv4_addr, 32);
+          char result[128];
+          sprintf(result, "%s 0.0.0.0 101.6.6.6 166.111.8.28 166.111.8.29",
+                  ipv4_addr);
 
           write_req_t *wr = (write_req_t *)malloc(sizeof(write_req_t));
           size_t msg_length = strlen(result) + HEADER_LEN;
@@ -142,13 +175,16 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
         } else if (msg->type == 102) {
           // got data request
           size_t length = msg->length - HEADER_LEN;
-          printf("Got data response of length %ld\n", length);
+          print("Got data response of length %ld\n", length);
           static int index = 0;
           write(tun_fds[(index++) % TUN_FDS], msg->data, length);
         } else if (msg->type == 104) {
-          printf("Got heartbeat from client\n");
+          char ipv4_addr[32];
+          uv_ip4_name(&p->v4addr, ipv4_addr, 32);
+          print("Got heartbeat from client %s\n", ipv4_addr);
+          p->secs = time(nullptr);
         } else {
-          printf("Unrecognized type: %d\n", msg->type);
+          print("Unrecognized type: %d\n", msg->type);
         }
 
         p->recv_buffer.erase(p->recv_buffer.begin(),
@@ -163,15 +199,42 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
 }
 
 void on_heartbeat_timer(uv_timer_t *handle) {
-  /*
-if (tcp_stream) {
-  printf("Sending heartbeat\n");
-  struct Msg heartbeat = {.type = 104, .length = HEADER_LEN};
-  uv_buf_t buf = uv_buf_init((char *)&heartbeat, heartbeat.length);
-  uv_write_t write_req;
-  uv_write(&write_req, tcp_stream, &buf, 1, on_write);
-}
-*/
+  struct User_Info_Table *prev = nullptr;
+  struct User_Info_Table *p = users;
+  while (p != nullptr) {
+    p->count--;
+    char ipv4_addr[32];
+    uv_ip4_name(&p->v4addr, ipv4_addr, 32);
+    if (p->count == 0) {
+      print("Sending heartbeat to client %s\n", ipv4_addr);
+      p->count = 20;
+
+      write_req_t *wr = (write_req_t *)malloc(sizeof(write_req_t));
+      size_t msg_length = HEADER_LEN;
+      wr->buf = uv_buf_init((char *)malloc(msg_length), msg_length);
+
+      struct Msg *new_msg = (struct Msg *)wr->buf.base;
+      new_msg->type = 104;
+      new_msg->length = msg_length;
+      uv_write((uv_write_t *)wr, (uv_stream_t *)&p->tcp_client, &wr->buf, 1,
+               on_write);
+    }
+    if (time(nullptr) - p->secs > 60) {
+      print("Client %s has no heartbeat too long, close it\n", ipv4_addr);
+      struct User_Info_Table *c = p;
+      if (prev) {
+        prev->pNext = c->pNext;
+      } else {
+        users = c->pNext;
+      }
+      uv_read_stop((uv_stream_t *)&c->tcp_client);
+      p = c->pNext;
+      delete c;
+      continue;
+    }
+    prev = p;
+    p = p->pNext;
+  }
 }
 
 void on_tun_data(uv_poll_t *handle, int status, int events) {
@@ -196,22 +259,22 @@ void on_tun_data(uv_poll_t *handle, int status, int events) {
           uv_write((uv_write_t *)wr, (uv_stream_t *)&p->tcp_client, &wr->buf, 1,
                    on_write);
 
-          printf("IP len in header: %d\n", (int)ntohs(hdr->tot_len));
-          printf("Got data of size %ld from tun and sent to client\n", len);
+          print("IP len in header: %d\n", (int)ntohs(hdr->tot_len));
+          print("Got data of size %ld from tun and sent to client\n", len);
           break;
         }
         p = p->pNext;
       }
     } else if (hdr->version == 6) {
-      printf("Ignoring IPv6 packet\n");
+      print("Ignoring IPv6 packet\n");
     } else {
-      printf("Unrecognized IP packet with version %x\n", hdr->version);
+      print("Unrecognized IP packet with version %x\n", hdr->version);
     }
   }
 }
 
 void on_shutdown(uv_shutdown_t *req, int status) {
-  printf("Connection closed\n");
+  print("Connection closed\n");
   delete req;
 }
 
@@ -220,7 +283,7 @@ void on_client_connected(uv_stream_t *req, int status) {
     uv_error("Failed to initiate tcp connection", status);
     return;
   }
-  printf("A new tcp connection\n");
+  print("A new tcp connection\n");
 
   // 0 is never valid
   int empty_slot = 0;
@@ -233,13 +296,13 @@ void on_client_connected(uv_stream_t *req, int status) {
   }
 
   if (empty_slot) {
-    printf("Accepted new client\n");
+    print("Accepted new client\n");
     // ip available
     User_Info_Table *new_users = new User_Info_Table;
     new_users->pNext = users;
     users = new_users;
     users->count = 20;
-    users->secs = 0;
+    users->secs = time(nullptr);
     users->v4addr = ip_pool[empty_slot].addr;
     uv_tcp_init(loop, &users->tcp_client);
     uv_accept(req, (uv_stream_t *)&users->tcp_client);
@@ -277,6 +340,9 @@ int main() {
     polls[i].data = (void *)(size_t)tun_fds[i];
     uv_poll_start(&polls[i], UV_READABLE, on_tun_data);
   }
+
+  uv_timer_init(loop, &timer);
+  uv_timer_start(&timer, on_heartbeat_timer, 1000, 1000);
 
   uv_tcp_init(loop, &tcp_server);
   uv_tcp_bind(&tcp_server, (struct sockaddr *)&addr, 0);
