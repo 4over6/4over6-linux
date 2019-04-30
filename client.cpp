@@ -5,6 +5,7 @@
 #include <linux/if_tun.h>
 #include <linux/ip.h>
 #include <netinet/in.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,7 +166,9 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
 void on_heartbeat_timer(uv_timer_t *handle) {
   if (tcp_stream) {
     print("Sending heartbeat\n");
-    struct Msg heartbeat = {.type = 104, .length = HEADER_LEN};
+    struct Msg heartbeat;
+    heartbeat.type = 104;
+    heartbeat.length = HEADER_LEN;
     uv_buf_t buf = uv_buf_init((char *)&heartbeat, heartbeat.length);
     uv_write_t write_req;
     uv_write(&write_req, tcp_stream, &buf, 1, on_write);
@@ -210,7 +213,9 @@ void on_server_connected(uv_connect_t *req, int status) {
 
   uv_read_start(req->handle, alloc_cb, on_remote_data);
 
-  struct Msg ask_for_addr = {.type = 100, .length = HEADER_LEN};
+  struct Msg ask_for_addr;
+  ask_for_addr.type = 100;
+  ask_for_addr.length = HEADER_LEN;
   uv_buf_t buf = uv_buf_init((char *)&ask_for_addr, ask_for_addr.length);
   uv_write_t write_req;
   uv_write(&write_req, tcp_stream, &buf, 1, on_write);
