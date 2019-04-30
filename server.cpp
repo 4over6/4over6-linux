@@ -5,6 +5,7 @@
 #include <linux/if_tun.h>
 #include <linux/ip.h>
 #include <netinet/in.h>
+#include <resolv.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -173,8 +174,14 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
           char ipv4_addr[32];
           uv_ip4_name(&p->v4addr, ipv4_addr, 32);
           char result[128];
-          sprintf(result, "%s 0.0.0.0 101.6.6.6 166.111.8.28 166.111.8.29",
-                  ipv4_addr);
+
+          res_init();
+          sprintf(result, "%s 0.0.0.0", ipv4_addr);
+          for (int i = 0; i < 3; i++) {
+            uv_ip4_name(&_res.nsaddr_list[i], ipv4_addr, 32);
+            sprintf(result, "%s %s", result, ipv4_addr);
+          }
+          print("result %s\n", result);
 
           write_req_t *wr = (write_req_t *)malloc(sizeof(write_req_t));
           size_t msg_length = strlen(result) + HEADER_LEN;
