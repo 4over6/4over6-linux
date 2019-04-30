@@ -96,11 +96,10 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
   if (nread < 0) {
     if (nread == UV_EOF) {
       print("Server closed the connection, exiting.");
-      exit(0);
     } else {
       uv_error("Got error when reading", nread);
     }
-    return;
+    exit(0);
   }
 
   recv_buffer.insert(recv_buffer.end(), buf->base, buf->base + nread);

@@ -113,6 +113,8 @@ void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
   buf->len = suggested_size;
 }
 
+void on_close(uv_handle_t *handle) { print("Connection closed\n"); }
+
 void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
   if (nread < 0) {
     if (nread == UV_EOF) {
@@ -131,17 +133,22 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
           } else {
             users = p->pNext;
           }
+          for (int i = 0; i < IP_POOL_SIZE; i++) {
+            if (ip_pool[i].addr.sin_addr.s_addr == p->v4addr.sin_addr.s_addr) {
+              ip_pool[i].status = 0;
+              break;
+            }
+          }
           delete p;
           break;
         }
         prev = p;
         p = p->pNext;
       }
-      uv_read_stop(handle);
     } else {
       uv_error("Got error when reading", nread);
-      uv_read_stop(handle);
     }
+    uv_close((uv_handle_t *)handle, on_close);
     return;
   }
 
@@ -227,7 +234,13 @@ void on_heartbeat_timer(uv_timer_t *handle) {
       } else {
         users = c->pNext;
       }
-      uv_read_stop((uv_stream_t *)&c->tcp_client);
+      for (int i = 0; i < IP_POOL_SIZE; i++) {
+        if (ip_pool[i].addr.sin_addr.s_addr == p->v4addr.sin_addr.s_addr) {
+          ip_pool[i].status = 0;
+          break;
+        }
+      }
+      uv_close((uv_handle_t *)&c->tcp_client, on_close);
       p = c->pNext;
       delete c;
       continue;
@@ -273,11 +286,6 @@ void on_tun_data(uv_poll_t *handle, int status, int events) {
   }
 }
 
-void on_shutdown(uv_shutdown_t *req, int status) {
-  print("Connection closed\n");
-  delete req;
-}
-
 void on_client_connected(uv_stream_t *req, int status) {
   if (status < 0) {
     uv_error("Failed to initiate tcp connection", status);
@@ -296,7 +304,9 @@ void on_client_connected(uv_stream_t *req, int status) {
   }
 
   if (empty_slot) {
-    print("Accepted new client\n");
+    char ipv4_addr[32];
+    uv_ip4_name(&ip_pool[empty_slot].addr, ipv4_addr, 32);
+    print("Accepted new client %s\n", ipv4_addr);
     // ip available
     User_Info_Table *new_users = new User_Info_Table;
     new_users->pNext = users;
@@ -309,8 +319,11 @@ void on_client_connected(uv_stream_t *req, int status) {
     uv_read_start((uv_stream_t *)&users->tcp_client, alloc_cb, on_remote_data);
   } else {
     // no ip available
-    uv_shutdown_t *shutdown = new uv_shutdown_t;
-    uv_shutdown(shutdown, req, on_shutdown);
+    print("No ip available for new client\n");
+    uv_tcp_t tcp_client;
+    uv_tcp_init(loop, &tcp_client);
+    uv_accept(req, (uv_stream_t *)&tcp_client);
+    uv_close((uv_handle_t *)&tcp_client, on_close);
   }
 }
 
