@@ -135,7 +135,8 @@ void *server_read(void *arg) {
       if (msg_type == 103) {
         memcpy(buffer + sizeof(struct tun_pi), body, len);
         static int index = 0;
-        pth_write(tun_fds[(index++) % TUN_FDS], buffer, len + sizeof(struct tun_pi));
+        pth_write(tun_fds[(index++) % TUN_FDS], buffer,
+                  len + sizeof(struct tun_pi));
       } else if (msg_type == 101) {
         char ip[32], route[32], dns1[32], dns2[32], dns3[32];
 
@@ -252,7 +253,7 @@ void *connect_server(void *arg) {
   attr = pth_attr_new();
 
   pth_attr_set(attr, PTH_ATTR_NAME, "tun_read");
-  for (int i = 0; i < TUN_FDS;i++) {
+  for (int i = 0; i < TUN_FDS; i++) {
     int *fds = (int *)malloc(2 * sizeof(int));
     fds[0] = socket_fd, fds[1] = tun_fds[i];
     pth_t tun = pth_spawn(attr, tun_read, (void *)fds);
