@@ -116,6 +116,11 @@ void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
 
 void on_close(uv_handle_t *handle) { print("Connection closed\n"); }
 
+void on_shutdown(uv_shutdown_t *req, int status) {
+  uv_close((uv_handle_t *)req->handle, on_close);
+  free(req);
+}
+
 void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
   if (nread < 0) {
     if (nread == UV_EOF) {
@@ -149,7 +154,8 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
     } else {
       uv_error("Got error when reading", nread);
     }
-    uv_close((uv_handle_t *)handle, on_close);
+    uv_shutdown_t *shutdown = (uv_shutdown_t *)malloc(sizeof(uv_shutdown_t));
+    uv_shutdown(shutdown, handle, on_shutdown);
     return;
   }
 
@@ -321,10 +327,12 @@ void on_client_connected(uv_stream_t *req, int status) {
   } else {
     // no ip available
     print("No ip available for new client\n");
-    uv_tcp_t tcp_client;
-    uv_tcp_init(loop, &tcp_client);
-    uv_accept(req, (uv_stream_t *)&tcp_client);
-    uv_close((uv_handle_t *)&tcp_client, on_close);
+    uv_tcp_t *tcp_client = (uv_tcp_t *)malloc(sizeof(uv_tcp_t));
+    uv_tcp_init(loop, tcp_client);
+    uv_accept(req, (uv_stream_t *)tcp_client);
+
+    uv_shutdown_t *shutdown = (uv_shutdown_t *)malloc(sizeof(uv_shutdown_t));
+    uv_shutdown(shutdown, (uv_stream_t *)tcp_client, on_shutdown);
   }
 }
 
@@ -362,7 +370,7 @@ int main() {
   uv_tcp_bind(&tcp_server, (struct sockaddr *)&addr, 0);
   if ((err = uv_listen((uv_stream_t *)&tcp_server, 10, on_client_connected)) <
       0) {
-    uv_error("Failed to initiate connection to server", err);
+    uv_error("Failed to listen to port", err);
   }
 
   return uv_run(loop, UV_RUN_DEFAULT);

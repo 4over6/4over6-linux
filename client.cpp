@@ -236,7 +236,7 @@ int main(int argc, char **argv) {
   loop = uv_default_loop();
 
   tun_fd = tun_alloc(tun_name);
-  run_cmd("ip netns add %s", tun_name);
+  run_cmd("ip netns add %s 2>/dev/null", tun_name);
   run_cmd("ip link set dev %s netns %s", tun_name, tun_name);
   run_cmd("ip -n %s link set dev %s mtu %d", tun_name, tun_name,
           1500 - HEADER_LEN);
