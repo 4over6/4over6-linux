@@ -118,8 +118,12 @@ void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
 void on_close(uv_handle_t *handle) { print("Connection closed\n"); }
 
 void on_shutdown(uv_shutdown_t *req, int status) {
-  uv_close((uv_handle_t *)req->handle, on_close);
-  free(req);
+  if (status == 0) {
+    uv_close((uv_handle_t *)req->handle, on_close);
+    free(req);
+  } else {
+    uv_error("Got error when shutdown", nread);
+  }
 }
 
 void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {

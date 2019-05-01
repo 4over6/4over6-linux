@@ -183,7 +183,8 @@ void on_tun_data(uv_poll_t *handle, int status, int events) {
     if (len >= sizeof(struct iphdr)) {
       struct iphdr *hdr = (struct iphdr *)buf;
       if (hdr->version == 4) {
-        struct Msg data = {.type = 102};
+        struct Msg data;
+        data.type = 102;
         memcpy(data.data, buf, len);
         data.length = len + HEADER_LEN;
         uv_buf_t buffer = uv_buf_init((char *)&data, len + HEADER_LEN);
