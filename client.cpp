@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <iostream>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <linux/ip.h>
@@ -17,11 +18,18 @@
 #include <uv.h>
 #include <vector>
 
+#include "args.hxx"
+
 #define print(fmt, args...)                                                    \
-  printf("DEBUG: %s:%d:%s(): " fmt, __FILE__, __LINE__, __func__, ##args)
+  if(verbose) printf("DEBUG: %s:%d:%s(): " fmt, __FILE__, __LINE__, __func__, ##args)
 
 char server[1024] = "2402:f000:1:4417::900";
+uint16_t port = 5678;
 char tun_name[IFNAMSIZ] = "4over6";
+bool no_netns = false;
+bool no_route = false;
+bool verbose = false;
+
 uv_loop_t *loop;
 int tun_fd;
 uv_stream_t *tcp_stream;
@@ -38,6 +46,46 @@ struct Msg {
 };
 
 const static int HEADER_LEN = sizeof(uint32_t) + sizeof(uint8_t);
+
+void arg_parse(int argc, char **argv) {
+  args::ArgumentParser parser("Linux client implementation of a custom 4over6 protocol");
+  args::HelpFlag help(parser, "help", "Display this help menu", {'h', "help"});
+  args::ValueFlag<std::string> arg_server(parser, "ADDRESS", "server address", {'s', "server"});
+  args::ValueFlag<uint16_t> arg_port(parser, "PORT", "server port", {'p', "port"});
+  args::Flag arg_nonetns(parser, "NONETNS", "disable netns", {"no-netns"});
+  args::Flag arg_noroute(parser, "NOROUTE", "disable routing", {"no-route"});
+  args::Flag arg_verbose(parser, "VERBOSE", "verbose", {'v', "verbose"});
+
+  try {
+    parser.ParseCLI(argc, argv);
+  } catch (args::Help) {
+    std::cout << parser;
+    exit(0);
+  } catch (args::ParseError e) {
+    std::cerr << e.what() << std::endl;
+    std::cerr << parser;
+    exit(1);
+  } catch (args::ValidationError e) {
+    std::cerr << e.what() << std::endl;
+    std::cerr << parser;
+    exit(1);
+  }
+
+  if(arg_server) {
+    struct sockaddr_in6 sa;
+    if(inet_pton(AF_INET6, args::get(arg_server).c_str(), &(sa.sin6_addr))!=0) {
+      strcpy(server, args::get(arg_server).c_str());
+    } else {
+      printf("Invalid server address %s\n", args::get(arg_server).c_str());
+      exit(1);
+    }
+  }
+
+  if(args::get(arg_port)) port = args::get(arg_port);
+  if(args::get(arg_nonetns)) no_netns = true;
+  if(args::get(arg_noroute)) no_route = true;
+  if(args::get(arg_verbose)) verbose = true;
+}
 
 void uv_error(const char *s, int err) {
   print("%s: %s\n", s, uv_strerror(err));
@@ -130,12 +178,21 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
       }
       if (count >= 1) {
         print("Got ip addr %s\n", data[0]);
-        run_cmd("ip -n %s a add local %s/32 dev %s", tun_name, data[0],
-                tun_name);
+        if(no_netns) {
+          run_cmd("ip a add local %s/32 dev %s", data[0], tun_name);
+        } else {
+          run_cmd("ip -n %s a add local %s/32 dev %s", tun_name, data[0], tun_name);
+        }
       }
       if (count >= 2) {
         print("Got ip route %s\n", data[1]);
-        run_cmd("ip -n %s r add %s/0 dev %s", tun_name, data[1], tun_name);
+        if(!no_route) {
+          if(no_netns) {
+            run_cmd("ip r add %s/0 dev %s", data[1], tun_name);
+          } else {
+            run_cmd("ip -n %s r add %s/0 dev %s", tun_name, data[1], tun_name);
+          }
+        }
       }
       if (count >= 3) {
         print("Got dns1 %s\n", data[2]);
@@ -230,21 +287,24 @@ void on_server_connected(uv_connect_t *req, int status) {
 
 int main(int argc, char **argv) {
   int err;
-  if (argc > 1) {
-    // unsafe
-    strcpy(server, argv[1]);
-  }
+  arg_parse(argc, argv);
+
   loop = uv_default_loop();
 
   tun_fd = tun_alloc(tun_name);
-  run_cmd("sh -c 'ip netns add %s 2>/dev/null'", tun_name);
-  run_cmd("ip link set dev %s netns %s", tun_name, tun_name);
-  run_cmd("ip -n %s link set dev %s mtu %d", tun_name, tun_name,
-          1500 - HEADER_LEN);
-  run_cmd("ip -n %s link set dev %s up", tun_name, tun_name);
+  if(no_netns) {
+    run_cmd("ip link set dev %s mtu %d", tun_name, 1500 - HEADER_LEN);
+    run_cmd("ip link set dev %s up", tun_name);
+  } else {
+    run_cmd("sh -c 'ip netns add %s 2>/dev/null'", tun_name);
+    run_cmd("ip link set dev %s netns %s", tun_name, tun_name);
+    run_cmd("ip -n %s link set dev %s mtu %d", tun_name, tun_name,
+            1500 - HEADER_LEN);
+    run_cmd("ip -n %s link set dev %s up", tun_name, tun_name);
+  }
 
   struct sockaddr_in6 addr;
-  uv_ip6_addr(server, 5678, &addr);
+  uv_ip6_addr(server, port, &addr);
 
   uv_tcp_init(loop, &tcp);
   if ((err = uv_tcp_connect(&tcp_connect, &tcp, (struct sockaddr *)&addr,
