@@ -1,0 +1,11 @@
+[Unit]
+Description=Linux client implementation of a custom 4over6 protocol
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/4over6/%i.conf
+ExecStart=/usr/bin/4over6-client --no-netns $CLIENT_ARGS
+
+[Install]
+WantedBy=multi-user.target

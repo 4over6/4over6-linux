@@ -2,4 +2,6 @@
 !*.cpp
 !*.hxx
 !*.md
+!*.service
+!example.conf
 !.gitignore
