@@ -26,14 +26,16 @@ It will create a TUN device called `4over6server` and assign an IP to it (don't 
 
 ### Client side
 
-Run `sudo ./client [server_addr]`
+Run `sudo ./client -s [server_addr]`
 
 ```shell
 sudo ./client # default server addr
-sudo ./client :: # server on localhost
+sudo ./client -s :: # server on localhost
 ```
 
-It will create a netns called `4over6` and create a TUN device called `4over6` in the newly created netns. You can type `sudo ip netns 4over6 bash` to enter the netns.
+It will create a netns called `4over6` and create a TUN device called `4over6` in the newly created netns. You can type `sudo ip netns exec 4over6 bash` to enter the netns. If you don't want a netns, you can set `--no-netns` to disable it.
+
+More command line arguments can be found by `./client -h`.
 
 If you have everything configured correctly, you can now ping the server address:
 
