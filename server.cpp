@@ -19,8 +19,12 @@
 #include <uv.h>
 #include <vector>
 
+#ifdef DEBUG
 #define print(fmt, args...)                                                    \
   printf("DEBUG: %s:%d:%s(): " fmt, __FILE__, __LINE__, __func__, ##args)
+#else
+#define print(fmt, args...)
+#endif
 
 char tun_name[IFNAMSIZ] = "4over6server";
 uv_loop_t *loop;
@@ -122,7 +126,7 @@ void on_shutdown(uv_shutdown_t *req, int status) {
     uv_close((uv_handle_t *)req->handle, on_close);
     free(req);
   } else {
-    uv_error("Got error when shutdown", nread);
+    uv_error("Got error when shutdown", status);
   }
 }
 
