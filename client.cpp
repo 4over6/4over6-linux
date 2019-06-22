@@ -134,6 +134,9 @@ void on_write(uv_write_t *req, int status) {
     uv_error("Got error upon writing", status);
     return;
   }
+  if (req) {
+    free(req);
+  }
 }
 
 void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
@@ -227,8 +230,8 @@ void on_heartbeat_timer(uv_timer_t *handle) {
     heartbeat.type = 104;
     heartbeat.length = HEADER_LEN;
     uv_buf_t buf = uv_buf_init((char *)&heartbeat, heartbeat.length);
-    uv_write_t write_req;
-    uv_write(&write_req, tcp_stream, &buf, 1, on_write);
+    uv_write_t *write_req = (uv_write_t *)malloc(sizeof(uv_write_t));
+    uv_write(write_req, tcp_stream, &buf, 1, on_write);
   }
 }
 
@@ -245,8 +248,8 @@ void on_tun_data(uv_poll_t *handle, int status, int events) {
         memcpy(data.data, buf, len);
         data.length = len + HEADER_LEN;
         uv_buf_t buffer = uv_buf_init((char *)&data, len + HEADER_LEN);
-        uv_write_t write_req;
-        uv_write(&write_req, tcp_stream, &buffer, 1, on_write);
+        uv_write_t *write_req = (uv_write_t *)malloc(sizeof(uv_write_t));
+        uv_write(write_req, tcp_stream, &buffer, 1, on_write);
         print("IP len in header: %d\n", (int)ntohs(hdr->tot_len));
         print("Got data of size %ld from tun and sent to server\n", len);
       } else if (hdr->version == 6) {
@@ -275,8 +278,8 @@ void on_server_connected(uv_connect_t *req, int status) {
   ask_for_addr.type = 100;
   ask_for_addr.length = HEADER_LEN;
   uv_buf_t buf = uv_buf_init((char *)&ask_for_addr, ask_for_addr.length);
-  uv_write_t write_req;
-  uv_write(&write_req, tcp_stream, &buf, 1, on_write);
+  uv_write_t *write_req = (uv_write_t *)malloc(sizeof(uv_write_t));
+  uv_write(write_req, tcp_stream, &buf, 1, on_write);
 
   uv_timer_init(loop, &timer);
   uv_timer_start(&timer, on_heartbeat_timer, 1000, 20 * 1000);
