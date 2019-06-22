@@ -21,7 +21,8 @@
 #include "args.hxx"
 
 #define print(fmt, args...)                                                    \
-  if(verbose) printf("DEBUG: %s:%d:%s(): " fmt, __FILE__, __LINE__, __func__, ##args)
+  if (verbose)                                                                 \
+  printf("DEBUG: %s:%d:%s(): " fmt, __FILE__, __LINE__, __func__, ##args)
 
 char server[1024] = "2402:f000:1:4417::900";
 uint16_t port = 5678;
@@ -29,6 +30,8 @@ char tun_name[IFNAMSIZ] = "4over6";
 bool no_netns = false;
 bool no_route = false;
 bool verbose = false;
+bool no_delay = false;
+bool quick_ack = false;
 
 uv_loop_t *loop;
 int tun_fd;
@@ -48,12 +51,17 @@ struct Msg {
 const static int HEADER_LEN = sizeof(uint32_t) + sizeof(uint8_t);
 
 void arg_parse(int argc, char **argv) {
-  args::ArgumentParser parser("Linux client implementation of a custom 4over6 protocol");
+  args::ArgumentParser parser(
+      "Linux client implementation of a custom 4over6 protocol");
   args::HelpFlag help(parser, "help", "Display this help menu", {'h', "help"});
-  args::ValueFlag<std::string> arg_server(parser, "ADDRESS", "server address", {'s', "server"});
-  args::ValueFlag<uint16_t> arg_port(parser, "PORT", "server port", {'p', "port"});
+  args::ValueFlag<std::string> arg_server(parser, "ADDRESS", "server address",
+                                          {'s', "server"});
+  args::ValueFlag<uint16_t> arg_port(parser, "PORT", "server port",
+                                     {'p', "port"});
   args::Flag arg_nonetns(parser, "NONETNS", "disable netns", {"no-netns"});
   args::Flag arg_noroute(parser, "NOROUTE", "disable routing", {"no-route"});
+  args::Flag arg_nodelay(parser, "NODELAY", "enable socket nodelay", {"no-delay"});
+  args::Flag arg_quickack(parser, "QUICKACK", "enable socket quickack", {"quick-ack"});
   args::Flag arg_verbose(parser, "VERBOSE", "verbose", {'v', "verbose"});
 
   try {
@@ -71,9 +79,10 @@ void arg_parse(int argc, char **argv) {
     exit(1);
   }
 
-  if(arg_server) {
+  if (arg_server) {
     struct sockaddr_in6 sa;
-    if(inet_pton(AF_INET6, args::get(arg_server).c_str(), &(sa.sin6_addr))!=0) {
+    if (inet_pton(AF_INET6, args::get(arg_server).c_str(), &(sa.sin6_addr)) !=
+        0) {
       strcpy(server, args::get(arg_server).c_str());
     } else {
       printf("Invalid server address %s\n", args::get(arg_server).c_str());
@@ -81,10 +90,18 @@ void arg_parse(int argc, char **argv) {
     }
   }
 
-  if(args::get(arg_port)) port = args::get(arg_port);
-  if(args::get(arg_nonetns)) no_netns = true;
-  if(args::get(arg_noroute)) no_route = true;
-  if(args::get(arg_verbose)) verbose = true;
+  if (args::get(arg_port))
+    port = args::get(arg_port);
+  if (args::get(arg_nonetns))
+    no_netns = true;
+  if (args::get(arg_noroute))
+    no_route = true;
+  if (args::get(arg_verbose))
+    verbose = true;
+  if (args::get(arg_nodelay))
+    no_delay = true;
+  if (args::get(arg_quickack))
+    quick_ack = true;
 }
 
 void uv_error(const char *s, int err) {
@@ -181,16 +198,17 @@ void on_remote_data(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf) {
       }
       if (count >= 1) {
         print("Got ip addr %s\n", data[0]);
-        if(no_netns) {
+        if (no_netns) {
           run_cmd("ip a add local %s/32 dev %s", data[0], tun_name);
         } else {
-          run_cmd("ip -n %s a add local %s/32 dev %s", tun_name, data[0], tun_name);
+          run_cmd("ip -n %s a add local %s/32 dev %s", tun_name, data[0],
+                  tun_name);
         }
       }
       if (count >= 2) {
         print("Got ip route %s\n", data[1]);
-        if(!no_route) {
-          if(no_netns) {
+        if (!no_route) {
+          if (no_netns) {
             run_cmd("ip r add %s/0 dev %s", data[1], tun_name);
           } else {
             run_cmd("ip -n %s r add %s/0 dev %s", tun_name, data[1], tun_name);
@@ -295,7 +313,7 @@ int main(int argc, char **argv) {
   loop = uv_default_loop();
 
   tun_fd = tun_alloc(tun_name);
-  if(no_netns) {
+  if (no_netns) {
     run_cmd("ip link set dev %s mtu %d", tun_name, 1500 - HEADER_LEN);
     run_cmd("ip link set dev %s up", tun_name);
   } else {
@@ -313,6 +331,17 @@ int main(int argc, char **argv) {
   if ((err = uv_tcp_connect(&tcp_connect, &tcp, (struct sockaddr *)&addr,
                             on_server_connected)) < 0) {
     uv_error("Failed to initiate connection to server", err);
+  }
+
+  int fd;
+  uv_fileno((uv_handle_t *)&tcp, &fd);
+  if (no_delay) {
+    int i = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (void *)&i, sizeof(i));
+  }
+  if (quick_ack) {
+    int i = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, (void *)&i, sizeof(i));
   }
 
   return uv_run(loop, UV_RUN_DEFAULT);
